@@ -1,0 +1,6 @@
+Training completed on: 2025-04-13 14:30:00
+Model: meta-llama/Meta-Llama-3-8B
+Dataset sizes - Train: 20000, Val: 2000
+Final training loss: 0.3955
+Final validation loss: 0.3700
+Total training steps: 2500
