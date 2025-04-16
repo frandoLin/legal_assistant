@@ -1,207 +1,192 @@
-import argparse
-import json
-import os
-import torch
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
-from transformers import DataCollatorForSeq2Seq
-from transformers.trainer_callback import EarlyStoppingCallback
-from peft import PrefixTuningConfig, get_peft_model, TaskType
-from peft.tuners.prefix_tuning import PrefixEncoder
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
+from peft import PrefixTuningConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+import torch
+import numpy as np
+from transformers.trainer_callback import TrainerCallback
+from datetime import datetime
+import matplotlib.pyplot as plt
+# Add at the top of your script
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base_model_path", type=str, default="meta-llama/Meta-Llama-3-8B", help="Base model to use")
-    parser.add_argument("--train_file", type=str, default="../data/formatted_train.jsonl", help="Path to training data")
-    parser.add_argument("--val_file", type=str, default="../data/formatted_val.jsonl", help="Path to validation data")
-    parser.add_argument("--output_dir", type=str, default="../models/llama3_prefix_tuned", help="Output directory for model")
-    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay")
-    parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length")
-    parser.add_argument("--num_virtual_tokens", type=int, default=32, help="Number of virtual tokens for prefix tuning")
-    parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit precision")
-    parser.add_argument("--use_fp16", action="store_true", help="Use FP16 for training")
-    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
-    return parser.parse_args()
+# Load dataset
+train_dataset = Dataset.from_json("../data/cuad_train.jsonl")
+val_dataset = Dataset.from_json("../data/cuad_val.jsonl")
 
-def load_dataset_from_jsonl(file_path):
-    """Load dataset from JSONL file"""
-    with open(file_path, 'r') as f:
-        data = [json.loads(line) for line in f]
-    return Dataset.from_list(data)
+print(f"Original dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-def preprocess_function(examples, tokenizer, max_length):
-    """Preprocess the data by tokenizing"""
-    # Format inputs for causal language modeling with instruction format
-    inputs = []
-    for instruction, inp, output in zip(examples["instruction"], examples["input"], examples["output"]):
-        # Format: <instruction>\n<input>\n<output>
-        text = f"{instruction}\n{inp}\n{output}"
-        inputs.append(text)
-    
-    # Tokenize inputs
-    model_inputs = tokenizer(
-        inputs, 
-        max_length=max_length,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt"
-    )
-    
-    # Create labels
-    labels = model_inputs["input_ids"].clone()
-    
-    # Mask padding tokens from loss
-    labels[labels == tokenizer.pad_token_id] = -100
-    model_inputs["labels"] = labels
-    
-    return model_inputs
+# Reduce dataset size with stratified sampling to maintain class distribution
+# Shuffle with a fixed seed for reproducibility
+train_dataset = train_dataset.shuffle(seed=42)
+val_dataset = val_dataset.shuffle(seed=42)
 
-def main():
-    args = parse_args()
-    
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    print(f"Loading base model: {args.base_model_path}")
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
-    # Add padding token if not present
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    # Load model
-    print(f"Loading model in {'8-bit' if args.load_in_8bit else 'full precision'}")
-    model_kwargs = {
-        "device_map": "auto",
-    }
-    
-    if args.load_in_8bit:
-        model_kwargs["load_in_8bit"] = True
-    
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model_path,
-        torch_dtype=torch.float16,
-        **model_kwargs
-    )
-    
-    # Configure prefix tuning
-    print(f"Setting up prefix tuning with {args.num_virtual_tokens} virtual tokens")
-    peft_config = PrefixTuningConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        num_virtual_tokens=args.num_virtual_tokens,
-        token_dim=base_model.config.hidden_size,
-        num_transformer_submodules=1,  # For Llama, use 1 instead of default
-        num_attention_heads=base_model.config.num_attention_heads,
-        num_layers=base_model.config.num_hidden_layers,
-        encoder_hidden_size=base_model.config.hidden_size,
-        prefix_projection=True,
-    )
-    
-    # Convert to PEFT model
-    model = get_peft_model(base_model, peft_config)
-    model.print_trainable_parameters()
-    
-    # Load datasets
-    print(f"Loading datasets from {args.train_file} and {args.val_file}")
-    try:
-        train_dataset = load_dataset_from_jsonl(args.train_file)
-        val_dataset = load_dataset_from_jsonl(args.val_file)
-        print(f"Loaded {len(train_dataset)} training examples and {len(val_dataset)} validation examples")
-    except Exception as e:
-        print(f"Error loading datasets: {e}")
-        raise
+# Limit to 10,000 for training and 1,000 for validation
+train_dataset = train_dataset.select(range(min(20000, len(train_dataset))))
+val_dataset = val_dataset.select(range(min(2000, len(val_dataset))))
+
+print(f"Reduced dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+# Load tokenizer and model
+model_id = "meta-llama/Meta-Llama-3-8B"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+
+# Load model with memory-efficient settings
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    load_in_8bit=True,
+    device_map="auto",
+    torch_dtype=torch.float16,
+)
+
+# Prepare the model for k-bit training
+model = prepare_model_for_kbit_training(model)
+
+# Prefix tuning config
+prefix_config = PrefixTuningConfig(
+    task_type=TaskType.CAUSAL_LM,
+    inference_mode=False,
+    num_virtual_tokens=32,
+    token_dim=model.config.hidden_size,
+    num_transformer_submodules=1,  # For Llama models
+    num_attention_heads=model.config.num_attention_heads,
+    num_layers=model.config.num_hidden_layers,
+    encoder_hidden_size=model.config.hidden_size,
+    prefix_projection=True,
+)
+model = get_peft_model(model, prefix_config)
+print(f"Trainable parameters: {model.print_trainable_parameters()}")
+
+# Format inputs for causal language modeling
+def tokenize_fn(example):
+    full_text = f"{example['instruction']}\n{example['input']}\nExplanation: {example['output']}"
+    tokenized = tokenizer(full_text, padding="max_length", truncation=True, max_length=256)
+    tokenized["labels"] = tokenized["input_ids"].copy()
+    return tokenized
+
+# Process datasets
+print("Processing training data...")
+train_data = train_dataset.map(tokenize_fn)
+print("Processing validation data...")
+val_data = val_dataset.map(tokenize_fn)
+
+
+# Create metrics callback to track and plot metrics
+class MetricsCallback(TrainerCallback):
+    def __init__(self):
+        self.train_losses = []
+        self.eval_losses = []
+        self.steps = []
+        self.last_logged_step = -1
         
-    # Preprocess datasets
-    print("Preprocessing datasets")
-    train_dataset = train_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer, args.max_length),
-        batched=True,
-        remove_columns=train_dataset.column_names,
-    )
+    def on_init_end(self, args, state, control, **kwargs):
+        # Required implementation
+        pass
     
-    val_dataset = val_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer, args.max_length),
-        batched=True,
-        remove_columns=val_dataset.column_names,
-    )
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Initialize tracking at training start
+        self.train_losses = []
+        self.eval_losses = []
+        self.steps = []
+        self.last_logged_step = -1
     
-    # Data collator
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        padding=True,
-        return_tensors="pt",
-    )
-    
-    # Set up training arguments
-    print("Configuring training")
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        evaluation_strategy="steps",
-        logging_strategy="steps",
-        logging_steps=50,
-        eval_steps=100,
-        save_strategy="steps",
-        save_steps=100,
-        save_total_limit=3,
-        load_best_model_at_end=True,
-        num_train_epochs=args.num_epochs,
-        learning_rate=args.learning_rate,
-        warmup_steps=args.warmup_steps,
-        weight_decay=args.weight_decay,
-        fp16=args.use_fp16,
-        report_to="tensorboard",
-        gradient_accumulation_steps=4,  # To help with batch size limitations
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-    )
-    
-    # Initialize trainer with early stopping
-    print("Initializing trainer")
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience)]
-    )
-    
-    # Train
-    print("Starting training")
-    trainer.train()
-    
-    # Save final model
-    print(f"Saving model to {args.output_dir}")
-    model.save_pretrained(args.output_dir)
-    
-    # Save tokenizer and training metadata
-    tokenizer.save_pretrained(args.output_dir)
-    
-    # Save training metadata
-    metadata = {
-        "base_model": args.base_model_path,
-        "tuning_type": "prefix",
-        "num_virtual_tokens": args.num_virtual_tokens,
-        "num_epochs": args.num_epochs,
-        "batch_size": args.batch_size,
-        "learning_rate": args.learning_rate,
-        "max_length": args.max_length,
-        "training_time": trainer.state.log_history[-1].get("train_runtime", "N/A"),
-        "date": trainer.state.log_history[-1].get("date", "N/A"),
-    }
-    
-    with open(os.path.join(args.output_dir, "training_metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
-    
-    print("Training complete!")
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+            
+        if "loss" in logs and state.global_step > self.last_logged_step:
+            self.train_losses.append(logs["loss"])
+            self.steps.append(state.global_step)
+            self.last_logged_step = state.global_step
+            
+        if "eval_loss" in logs:
+            self.eval_losses.append(logs["eval_loss"])
+            
+    def plot_metrics(self, save_path="../models/prefix_training_metrics.png"):
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.steps, self.train_losses, label="Training Loss")
+        
+        # Plot eval losses at their respective steps
+        if self.eval_losses:
+            # Handle case where we might have different numbers of eval and train steps
+            if len(self.steps) >= len(self.eval_losses):
+                # Evenly space eval points across the training steps
+                eval_indices = np.linspace(0, len(self.steps)-1, len(self.eval_losses), dtype=int)
+                eval_steps = [self.steps[i] for i in eval_indices]
+                plt.plot(eval_steps, self.eval_losses, label="Validation Loss", marker="o")
+            
+        plt.xlabel("Training Steps")
+        plt.ylabel("Loss")
+        plt.title(f"Prefix Tuning - Training and Validation Loss - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(save_path)
+        print(f"Metrics plot saved to {save_path}")
 
-if __name__ == "__main__":
-    main()
+metrics_callback = MetricsCallback()
+
+# Training arguments
+args = TrainingArguments(
+    output_dir="../models/llama3_prefix_tuned",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    num_train_epochs=2,
+    logging_steps=20,
+    evaluation_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
+    save_total_limit=1,
+    fp16=True,
+    gradient_checkpointing=True,
+    optim="paged_adamw_8bit",
+    learning_rate=5e-4,
+    report_to="none",
+    ddp_find_unused_parameters=False,
+    dataloader_pin_memory=True,
+    dataloader_num_workers=4,
+    weight_decay=0.01,
+    warmup_ratio=0.03,
+    max_grad_norm=0.3,
+)
+
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=train_data,
+    eval_dataset=val_data,
+    callbacks=[metrics_callback]
+)
+
+# Memory cleanup before training
+torch.cuda.empty_cache()
+print("Starting training...")
+train_result = trainer.train()
+
+# Print and save metrics
+print("\nTraining complete! Final metrics:")
+print(f"Training loss: {train_result.training_loss:.4f}")
+
+# Run final evaluation
+eval_result = trainer.evaluate()
+print(f"Validation loss: {eval_result['eval_loss']:.4f}")
+
+# Plot training metrics
+metrics_callback.plot_metrics()
+
+# Save the prefix tuned model
+model.save_pretrained("../models/llama3_prefix_tuned")
+print("Model saved successfully!")
+
+# Save training summary
+with open("../models/prefix_training_summary.txt", "w") as f:
+    f.write(f"Prefix Tuning completed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Model: {model_id}\n")
+    f.write(f"Number of virtual tokens: {prefix_config.num_virtual_tokens}\n")
+    f.write(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}\n")
+    f.write(f"Final training loss: {train_result.training_loss:.4f}\n")
+    f.write(f"Final validation loss: {eval_result['eval_loss']:.4f}\n")
+    f.write(f"Total training steps: {trainer.state.global_step}\n")
+
+print("Training summary saved to ../models/prefix_training_summary.txt")
