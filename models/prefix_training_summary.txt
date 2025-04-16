@@ -1,0 +1,8 @@
+Prefix Tuning completed on: 2025-04-16 18:43:32
+Model: meta-llama/Meta-Llama-3-8B
+Number of virtual tokens: 16
+Dataset sizes - Train: 20000, Val: 2000
+Final training loss: 1.0159
+Final validation loss: 1.0221
+Total training steps: 2500
+Note: Trained without using prepare_model_for_kbit_training to avoid gradient checkpointing
