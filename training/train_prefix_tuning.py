@@ -6,9 +6,12 @@ import numpy as np
 from transformers.trainer_callback import TrainerCallback
 from datetime import datetime
 import matplotlib.pyplot as plt
-# Add at the top of your script
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Try to use a non-gradient checkpointing approach for prefix tuning
+# First, let's disable using prepare_model_for_kbit_training since it might be enabling gradient checkpointing
+USE_KBIT_TRAINING = False
 
 # Load dataset
 train_dataset = Dataset.from_json("../data/cuad_train.jsonl")
@@ -17,46 +20,19 @@ val_dataset = Dataset.from_json("../data/cuad_val.jsonl")
 print(f"Original dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
 # Reduce dataset size with stratified sampling to maintain class distribution
-# Shuffle with a fixed seed for reproducibility
 train_dataset = train_dataset.shuffle(seed=42)
 val_dataset = val_dataset.shuffle(seed=42)
 
-# Limit to 10,000 for training and 1,000 for validation
+# Limit to 20,000 for training and 2,000 for validation
 train_dataset = train_dataset.select(range(min(20000, len(train_dataset))))
 val_dataset = val_dataset.select(range(min(2000, len(val_dataset))))
 
 print(f"Reduced dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-# Load tokenizer and model
+# Load tokenizer
 model_id = "meta-llama/Meta-Llama-3-8B"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 tokenizer.pad_token = tokenizer.eos_token
-
-# Load model with memory-efficient settings
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    load_in_8bit=True,
-    device_map="auto",
-    torch_dtype=torch.float16,
-)
-
-# Prepare the model for k-bit training
-model = prepare_model_for_kbit_training(model)
-
-# Prefix tuning config
-prefix_config = PrefixTuningConfig(
-    task_type=TaskType.CAUSAL_LM,
-    inference_mode=False,
-    num_virtual_tokens=32,
-    token_dim=model.config.hidden_size,
-    num_transformer_submodules=1,  # For Llama models
-    num_attention_heads=model.config.num_attention_heads,
-    num_layers=model.config.num_hidden_layers,
-    encoder_hidden_size=model.config.hidden_size,
-    prefix_projection=True,
-)
-model = get_peft_model(model, prefix_config)
-print(f"Trainable parameters: {model.print_trainable_parameters()}")
 
 # Format inputs for causal language modeling
 def tokenize_fn(example):
@@ -67,12 +43,66 @@ def tokenize_fn(example):
 
 # Process datasets
 print("Processing training data...")
-train_data = train_dataset.map(tokenize_fn)
+train_data = train_dataset.map(
+    lambda example: tokenize_fn(example), 
+    remove_columns=train_dataset.column_names
+)
 print("Processing validation data...")
-val_data = val_dataset.map(tokenize_fn)
+val_data = val_dataset.map(
+    lambda example: tokenize_fn(example),
+    remove_columns=val_dataset.column_names
+)
 
+# Delete original datasets to free up memory
+del train_dataset
+del val_dataset
+torch.cuda.empty_cache()
 
-# Create metrics callback to track and plot metrics
+# Load model without gradient checkpointing
+print("Loading model with gradient checkpointing explicitly disabled...")
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    load_in_8bit=True,
+    device_map="auto",
+    torch_dtype=torch.float16,
+    use_cache=True,  # Setting use_cache=True prevents gradient checkpointing
+)
+
+# Make absolutely sure gradient checkpointing is disabled
+if hasattr(model, "config"):
+    model.config.use_cache = True
+    setattr(model.config, "gradient_checkpointing", False)
+
+# Only use prepare_model_for_kbit_training if safe (it might enable gradient checkpointing)
+if USE_KBIT_TRAINING:
+    model = prepare_model_for_kbit_training(model)
+else:
+    # Instead, set modules to training mode manually
+    for param in model.parameters():
+        param.requires_grad = False  # freeze the model - train adapters later
+        if param.ndim == 1:
+            # cast the small parameters (e.g. layernorm) to fp32 for stability
+            param.data = param.data.to(torch.float32)
+
+    # For backward compatibility
+    model.is_loaded_in_8bit = True
+    model.model_parallel = True
+
+# Define prefix tuning config
+print("Setting up prefix tuning configuration...")
+prefix_config = PrefixTuningConfig(
+    task_type=TaskType.CAUSAL_LM,
+    inference_mode=False,
+    num_virtual_tokens=16,  # Use fewer virtual tokens
+    token_dim=model.config.hidden_size,
+    num_transformer_submodules=1,
+    num_attention_heads=model.config.num_attention_heads,
+    num_layers=model.config.num_hidden_layers,
+    encoder_hidden_size=model.config.hidden_size,
+    prefix_projection=True,
+)
+
+# Create metrics callback
 class MetricsCallback(TrainerCallback):
     def __init__(self):
         self.train_losses = []
@@ -81,11 +111,9 @@ class MetricsCallback(TrainerCallback):
         self.last_logged_step = -1
         
     def on_init_end(self, args, state, control, **kwargs):
-        # Required implementation
         pass
     
     def on_train_begin(self, args, state, control, **kwargs):
-        # Initialize tracking at training start
         self.train_losses = []
         self.eval_losses = []
         self.steps = []
@@ -107,11 +135,8 @@ class MetricsCallback(TrainerCallback):
         plt.figure(figsize=(12, 6))
         plt.plot(self.steps, self.train_losses, label="Training Loss")
         
-        # Plot eval losses at their respective steps
         if self.eval_losses:
-            # Handle case where we might have different numbers of eval and train steps
             if len(self.steps) >= len(self.eval_losses):
-                # Evenly space eval points across the training steps
                 eval_indices = np.linspace(0, len(self.steps)-1, len(self.eval_losses), dtype=int)
                 eval_steps = [self.steps[i] for i in eval_indices]
                 plt.plot(eval_steps, self.eval_losses, label="Validation Loss", marker="o")
@@ -126,11 +151,11 @@ class MetricsCallback(TrainerCallback):
 
 metrics_callback = MetricsCallback()
 
-# Training arguments
+# Training arguments - WITHOUT gradient_checkpointing
 args = TrainingArguments(
     output_dir="../models/llama3_prefix_tuned",
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=2,  # Smaller batch size
+    gradient_accumulation_steps=8,  # More gradient accumulation steps
     num_train_epochs=2,
     logging_steps=20,
     evaluation_strategy="steps",
@@ -139,7 +164,7 @@ args = TrainingArguments(
     save_steps=100,
     save_total_limit=1,
     fp16=True,
-    gradient_checkpointing=True,
+    # NO gradient_checkpointing here
     optim="paged_adamw_8bit",
     learning_rate=5e-4,
     report_to="none",
@@ -151,6 +176,12 @@ args = TrainingArguments(
     max_grad_norm=0.3,
 )
 
+# Now create the prefix-tuned model
+print("Creating prefix-tuned model...")
+model = get_peft_model(model, prefix_config)
+print(f"Trainable parameters: {model.print_trainable_parameters()}")
+
+# Create trainer
 trainer = Trainer(
     model=model,
     args=args,
@@ -159,7 +190,7 @@ trainer = Trainer(
     callbacks=[metrics_callback]
 )
 
-# Memory cleanup before training
+# Clean up memory before training
 torch.cuda.empty_cache()
 print("Starting training...")
 train_result = trainer.train()
@@ -184,9 +215,10 @@ with open("../models/prefix_training_summary.txt", "w") as f:
     f.write(f"Prefix Tuning completed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     f.write(f"Model: {model_id}\n")
     f.write(f"Number of virtual tokens: {prefix_config.num_virtual_tokens}\n")
-    f.write(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}\n")
+    f.write(f"Dataset sizes - Train: {len(train_data)}, Val: {len(val_data)}\n")
     f.write(f"Final training loss: {train_result.training_loss:.4f}\n")
     f.write(f"Final validation loss: {eval_result['eval_loss']:.4f}\n")
     f.write(f"Total training steps: {trainer.state.global_step}\n")
+    f.write(f"Note: Trained without using prepare_model_for_kbit_training to avoid gradient checkpointing\n")
 
 print("Training summary saved to ../models/prefix_training_summary.txt")
