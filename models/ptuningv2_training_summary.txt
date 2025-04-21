@@ -1,0 +1,8 @@
+P-Tuning v2 completed on: 2025-04-21 02:21:36
+Model: meta-llama/Meta-Llama-3-8B
+Number of virtual tokens: 16
+Dataset sizes - Train: 20000, Val: 2000
+Final training loss: 0.8802
+Final validation loss: 0.6034
+Total training steps: 2500
+Note: Using P-Tuning v2 with num_transformer_submodules=3 for deep prompting
