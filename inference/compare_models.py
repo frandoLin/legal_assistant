@@ -15,6 +15,7 @@ import numpy as np
 import argparse
 import random
 from datetime import datetime
+import gc
 
 # Set OpenAI API key via client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -66,24 +67,52 @@ def get_gpt4_evaluation(reference, prediction, instruction, input_text):
         print(f"Error calling OpenAI API: {e}")
         raise e
 
-def setup_model(model_name, adapter_path=None):
-    """Set up a model for evaluation"""
+def clear_gpu_memory():
+    """Aggressively clear GPU memory between model evaluations"""
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # Force garbage collection
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                del obj
+        except:
+            pass
+    
+    gc.collect()
+    torch.cuda.empty_cache()
+    time.sleep(10)  # Give system time to release memory
+
+def setup_model(model_name, adapter_path=None, adapter_type="lora"):
+    """Set up a model for evaluation with support for different adapter types"""
     print(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     
     print(f"Loading base model {model_name}...")
+    # Add CPU offloading options to fix memory issues
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         load_in_8bit=True,
         device_map="auto",
         torch_dtype=torch.float16,
+        llm_int8_enable_fp32_cpu_offload=True
     )
     
     if adapter_path:
-        print(f"Loading adapter from {adapter_path}...")
+        print(f"Loading {adapter_type} adapter from {adapter_path}...")
         model = PeftModel.from_pretrained(base_model, adapter_path)
-        model_label = f"{model_name}_LoRA"
+        
+        # Set model label based on adapter type
+        if adapter_type.lower() == "lora":
+            model_label = f"{model_name}_LoRA"
+        elif adapter_type.lower() == "ptuning":
+            model_label = f"{model_name}_PTuning"
+        elif adapter_type.lower() == "prefix":
+            model_label = f"{model_name}_Prefix"
+        else:
+            model_label = f"{model_name}_{adapter_type}"
     else:
         model = base_model
         model_label = f"{model_name}_base"
@@ -232,39 +261,36 @@ def create_visualizations(results_dict, output_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "model_comparison_table.png"))
     
-    # 4. Create a differences bar chart
-    if len(models) >= 2:
+    # 4. Create a differences bar chart comparing to base model
+    if "meta-llama/Meta-Llama-3-8B_base" in results_dict and len(models) > 1:
         plt.figure(figsize=(12, 8))
         
-        # Calculate differences
-        model1 = models[0]
-        model2 = models[1]
+        # Calculate differences vs base model
+        base_model = "meta-llama/Meta-Llama-3-8B_base"
         diff_data = []
         
-        for metric in metrics:
-            diff = results_dict[model2]["average_scores"][metric] - results_dict[model1]["average_scores"][metric]
-            diff_data.append({
-                "Metric": metric.capitalize(),
-                "Difference": diff
-            })
+        for model in models:
+            if model != base_model:
+                for metric in metrics:
+                    diff = results_dict[model]["average_scores"][metric] - results_dict[base_model]["average_scores"][metric]
+                    diff_data.append({
+                        "Model": model,
+                        "Metric": metric.capitalize(),
+                        "Improvement": diff
+                    })
         
         diff_df = pd.DataFrame(diff_data)
         
         # Plot
-        ax = sns.barplot(x="Metric", y="Difference", data=diff_df)
+        plt.figure(figsize=(12, 8))
+        ax = sns.barplot(x="Metric", y="Improvement", hue="Model", data=diff_df)
         plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
-        plt.title(f"Score Difference: {model2} vs {model1}", fontsize=16)
+        plt.title(f"Score Improvement vs Base Model", fontsize=16)
         plt.xlabel("Metric", fontsize=14)
-        plt.ylabel("Score Difference", fontsize=14)
-        
-        # Add value labels
-        for i, v in enumerate(diff_df["Difference"]):
-            color = "green" if v > 0 else "red"
-            plt.text(i, v + 0.1 if v > 0 else v - 0.3, f"{v:.2f}", 
-                    color=color, fontweight='bold', ha='center')
+        plt.ylabel("Score Improvement", fontsize=14)
         
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "model_improvement.png"))
+        plt.savefig(os.path.join(output_dir, "model_improvements.png"))
     
     print(f"Visualizations saved to {output_dir}")
 
@@ -367,7 +393,6 @@ def evaluate_model(model, tokenizer, model_label, test_data):
 def class_balanced_sample(data, n_samples):
     """Sample a balanced subset of positive and negative examples"""
     test_data = []
-    # positive_count, negative_count = 0, 0
     positive_samples, negative_samples = [], []
     negative_label = ["This sentence does not describe a specific legal clause.", "No relevant clause"]
 
@@ -388,31 +413,36 @@ def class_balanced_sample(data, n_samples):
         test_data.extend(random.sample(positive_samples, n_samples // 2))
         test_data.extend(random.sample(negative_samples, n_samples // 2))
 
-    # for i in range(len(data)):
-    #     while positive_count + negative_count < n_samples:
-            
-    #         if data[i]["output"] not in negative_label and positive_count < n_samples // 2:
-    #             positive_count += 1
-    #             test_data.append(data[i])
-    #         elif data[i]["output"] in negative_label and negative_count < n_samples // 2:
-    #             negative_count += 1
-    #             test_data.append(data[i])
-    #     break
-
     return test_data
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare base and LoRA models on legal tasks")
+    parser = argparse.ArgumentParser(description="Compare fine-tuning methods on legal tasks")
     parser.add_argument("--base_model", default="meta-llama/Meta-Llama-3-8B", help="Base model name")
     parser.add_argument("--lora_adapter", default="../models/llama3_lora_tuned", help="Path to LoRA adapter")
+    parser.add_argument("--ptuning_adapter", default="../models/llama3_ptuningv2_tuned", help="Path to P-Tuning adapter")
+    parser.add_argument("--prefix_adapter", default="../models/llama3_prefix_tuned", help="Path to Prefix Tuning adapter")
     parser.add_argument("--test_data", default="../data/cuad_test.jsonl", help="Path to test data")
     parser.add_argument("--samples", type=int, default=10, help="Number of samples to evaluate")
     parser.add_argument("--output_dir", default="../evaluation_results", help="Output directory for results")
+    parser.add_argument("--skip_base", action="store_true", help="Skip evaluation of base model")
+    parser.add_argument("--skip_lora", action="store_true", help="Skip evaluation of LoRA model")
+    parser.add_argument("--skip_ptuning", action="store_true", help="Skip evaluation of P-Tuning model")
+    parser.add_argument("--skip_prefix", action="store_true", help="Skip evaluation of Prefix Tuning model")
     args = parser.parse_args()
     
     # Create output directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(args.output_dir, f"comparison_{timestamp}")
+    model_parts = []
+    if not args.skip_base:
+        model_parts.append("base")
+    if not args.skip_lora:
+        model_parts.append("lora")
+    if not args.skip_ptuning:
+        model_parts.append("ptuning")
+    if not args.skip_prefix:
+        model_parts.append("prefix")
+
+    model_string = "_".join(model_parts)
+    output_dir = os.path.join(args.output_dir, f"compare_{model_string}")
     os.makedirs(output_dir, exist_ok=True)
     
     # Load test data
@@ -425,19 +455,50 @@ def main():
     
     print(f"Evaluating {len(test_data)} test samples")
     
-    # Setup and evaluate base model
-    base_model, base_tokenizer, base_label = setup_model(args.base_model)
-    base_results = evaluate_model(base_model, base_tokenizer, base_label, test_data)
-    del base_model
-    torch.cuda.empty_cache()
-    time.sleep(5)  # Allow time for GPU memory to clear
+    # Initialize results dictionary
+    results_dict = {}
     
-    # Setup and evaluate LoRA model
-    lora_model, lora_tokenizer, lora_label = setup_model(args.base_model, args.lora_adapter)
-    lora_results = evaluate_model(lora_model, lora_tokenizer, lora_label, test_data)
+    # Setup and evaluate base model (if not skipped)
+    if not args.skip_base:
+        base_model, base_tokenizer, base_label = setup_model(args.base_model)
+        base_results = evaluate_model(base_model, base_tokenizer, base_label, test_data)
+        results_dict[base_label] = base_results
+        del base_model, base_tokenizer
+        clear_gpu_memory()
+    
+    # Setup and evaluate LoRA model (if not skipped)
+    if not args.skip_lora:
+        lora_model, lora_tokenizer, lora_label = setup_model(args.base_model, args.lora_adapter, "lora")
+        lora_results = evaluate_model(lora_model, lora_tokenizer, lora_label, test_data)
+        results_dict[lora_label] = lora_results
+        del lora_model, lora_tokenizer
+        clear_gpu_memory()
+    
+    # Setup and evaluate P-Tuning model (if not skipped)
+    if not args.skip_ptuning and args.ptuning_adapter:
+        ptuning_model, ptuning_tokenizer, ptuning_label = setup_model(
+            args.base_model, args.ptuning_adapter, "ptuning"
+        )
+        ptuning_results = evaluate_model(ptuning_model, ptuning_tokenizer, ptuning_label, test_data)
+        results_dict[ptuning_label] = ptuning_results
+        del ptuning_model, ptuning_tokenizer
+        clear_gpu_memory()
+    
+    # Setup and evaluate Prefix Tuning model (if not skipped)
+    if not args.skip_prefix and args.prefix_adapter:
+        prefix_model, prefix_tokenizer, prefix_label = setup_model(
+            args.base_model, args.prefix_adapter, "prefix"
+        )
+        prefix_results = evaluate_model(prefix_model, prefix_tokenizer, prefix_label, test_data)
+        results_dict[prefix_label] = prefix_results
+        del prefix_model, prefix_tokenizer
+        clear_gpu_memory()
     
     # Save detailed logs
-    all_detailed_logs = base_results["detailed_log"] + lora_results["detailed_log"]
+    all_detailed_logs = []
+    for model_results in results_dict.values():
+        all_detailed_logs.extend(model_results["detailed_log"])
+    
     with open(os.path.join(output_dir, "detailed_evaluation_log.json"), "w") as f:
         json.dump(all_detailed_logs, f, indent=2)
     
@@ -446,11 +507,6 @@ def main():
     detailed_df.to_csv(os.path.join(output_dir, "detailed_results.csv"), index=False)
     
     # Save results for each model
-    results_dict = {
-        base_label: base_results,
-        lora_label: lora_results
-    }
-    
     with open(os.path.join(output_dir, "evaluation_results.json"), "w") as f:
         json.dump({
             model: {k: v for k, v in results.items() if k != "detailed_log"} 
@@ -462,36 +518,39 @@ def main():
     
     print(f"Evaluation complete! Results and visualizations saved to {output_dir}")
     
-    # Check for significant improvement
-    base_overall = base_results["average_scores"]["overall"]
-    lora_overall = lora_results["average_scores"]["overall"]
-    improvement = lora_overall - base_overall
+    # Compare model performances
+    print("\n=== Model Comparison ===")
+    model_names = list(results_dict.keys())
     
-    print("\n=== Deployment Decision ===")
-    if improvement > 0.2:
-        print(f"SIGNIFICANT IMPROVEMENT: +{improvement:.2f} points")
-        print(f"Recommendation: Deploy the LoRA model")
-    elif improvement > 0:
-        print(f"SLIGHT IMPROVEMENT: +{improvement:.2f} points")
-        print(f"Recommendation: Consider deploying if other factors warrant it")
-    else:
-        print(f"NO IMPROVEMENT: {improvement:.2f} points")
-        print(f"Recommendation: Keep the base model")
+    if "meta-llama/Meta-Llama-3-8B_base" in results_dict:
+        base_overall = results_dict["meta-llama/Meta-Llama-3-8B_base"]["average_scores"]["overall"]
+        print(f"Base Model Score: {base_overall:.2f}/10")
         
-    # Generate deployment decision file
-    decision = {
+        for model in model_names:
+            if model != "meta-llama/Meta-Llama-3-8B_base":
+                model_score = results_dict[model]["average_scores"]["overall"]
+                improvement = model_score - base_overall
+                print(f"{model} Score: {model_score:.2f}/10 ({'+' if improvement > 0 else ''}{improvement:.2f})")
+    
+    # Generate comparison summary
+    comparison = {
         "timestamp": datetime.now().isoformat(),
-        "base_model": base_label,
-        "lora_model": lora_label,
-        "base_score": base_overall,
-        "lora_score": lora_overall,
-        "improvement": improvement,
-        "should_deploy": improvement > 0.2,
-        "recommendation": "deploy" if improvement > 0.2 else "consider" if improvement > 0 else "keep_base"
+        "models_evaluated": model_names,
+        "scores": {model: results_dict[model]["average_scores"] for model in model_names},
     }
     
-    with open(os.path.join(output_dir, "deployment_decision.json"), "w") as f:
-        json.dump(decision, f, indent=2)
+    # Find best model overall
+    if len(model_names) > 1:
+        best_model = max(model_names, key=lambda m: results_dict[m]["average_scores"]["overall"])
+        best_score = results_dict[best_model]["average_scores"]["overall"]
+        comparison["best_model"] = {
+            "name": best_model,
+            "score": best_score
+        }
+        print(f"\nBest overall model: {best_model} (Score: {best_score:.2f}/10)")
+    
+    with open(os.path.join(output_dir, "model_comparison_summary.json"), "w") as f:
+        json.dump(comparison, f, indent=2)
 
 if __name__ == "__main__":
     main()
